@@ -212,10 +212,18 @@ function setUpPct(p) {
 async function checkResume(f) {
   const saved = lsGet()[lsKey(f)];
   if (!saved || !saved.session) return;
+  // 恢复表单到会话保存的设置，避免页面控件显示默认值而服务端会话是旧设置
+  if (saved.path) document.getElementById("up-path").value = saved.path;
+  if (saved.piece) {
+    const sel = document.getElementById("up-piece");
+    if ([...sel.options].some(o => +o.value === +saved.piece)) {
+      sel.value = String(saved.piece);
+    }
+  }
   const banner = document.getElementById("resume-banner");
   banner.style.display = "";
   banner.innerHTML = `⚠ 检测到未完成的上传会话：<b class="mono">${esc(saved.session)}</b>
-    （${esc(f.name)}，已收 ${saved.received?.length || 0}/${saved.total || "?"} 片）
+    （${esc(f.name)}，已收 ${saved.received?.length || 0}/${saved.total || "?"} 片，目标 ${esc(saved.path || "/")}）
     <button class="btn sm warn" id="resume-now" style="margin-left:10px">断点续传</button>
     <button class="btn sm ghost" id="resume-drop">放弃</button>`;
   document.getElementById("resume-now").onclick = () => { banner.style.display = "none"; startUpload(saved.session); };
@@ -226,10 +234,34 @@ async function checkResume(f) {
 }
 
 document.getElementById("up-start").onclick = () => startUpload(null);
-document.getElementById("up-pause").onclick = () => {
-  if (upState) { upState.paused = !upState.paused;
-    document.getElementById("up-pause").textContent = upState.paused ? "继续" : "暂停";
-    setUpStatus(upState.paused ? "已暂停（分片保留在服务端，可续传）" : "继续上传…"); }
+document.getElementById("up-pause").onclick = async () => {
+  if (!upState) return;
+  if (!upState.paused) {
+    upState.paused = true;
+    document.getElementById("up-pause").textContent = "继续";
+    setUpStatus("已暂停（分片保留在服务端，可修改目标目录 / 分片大小后继续）");
+    return;
+  }
+  // 恢复前先让服务端校验并同步页面当前的目标目录 / 分片大小。
+  // 参数有漂移时服务端会更新会话（分片大小变化则旧分片作废重传），
+  // 目标目录不存在则在此明确报错，继续保持暂停。
+  setUpStatus("校验续传参数…");
+  const oldGen = upState.gen || 0;
+  try {
+    const view = await syncSession(upState.session);
+    upState.paused = false;
+    document.getElementById("up-pause").textContent = "暂停";
+    const notes = [];
+    if (view.path_changed) notes.push("目标目录已切换为 " + view.path);
+    if (view.piece_reset) notes.push("分片大小已更新，已传分片作废，按新大小重传");
+    setUpStatus(notes.length ? "继续上传：" + notes.join("；") : "继续上传…");
+    if (notes.length) toast("续传参数已同步：" + notes.join("；"), "warn", 5000);
+    // 分片计划被重置 => 旧循环已退出，需要按新计划驱动新循环（含最终合并）
+    if (upState.gen !== oldGen) driveUpload();
+  } catch (e) {
+    setUpStatus("续传失败：" + e.message + "（仍处于暂停状态）");
+    toast("无法续传：" + e.message, "bad", 6000);
+  }
 };
 document.getElementById("up-reset").onclick = () => {
   if (upState) upState.aborted = true;
@@ -238,80 +270,125 @@ document.getElementById("up-reset").onclick = () => {
   fileInput.value = "";
 };
 
-async function startUpload(existingSession) {
-  if (!upFile) return toast("请先选择文件", "warn");
+// 调 /api/upload/begin 把页面当前设置同步到（续传）会话，并用返回视图
+// 更新本地状态 / 分片可视化 / localStorage。
+async function syncSession(sessionId) {
   const piece = +document.getElementById("up-piece").value;
   const path = document.getElementById("up-path").value.trim() || "/";
+  const begin = await api("POST", "/api/upload/begin", {
+    path, filename: upFile.name, size: upFile.size,
+    piece_size: piece, session: sessionId || undefined,
+  });
+  const prevGen = upState ? (upState.gen || 0) : 0;
+  upState = {
+    session: begin.session, total: begin.total_pieces, piece: begin.piece_size,
+    received: new Set(begin.received || []),
+    paused: upState ? upState.paused : false,
+    running: true, aborted: false,
+    path, gen: prevGen + (begin.piece_reset ? 1 : 0),
+  };
+  const all = lsGet();
+  all[lsKey(upFile)] = { session: begin.session, total: begin.total_pieces,
+                         piece: begin.piece_size, path };
+  lsSet(all);
+  renderPieces(upState.total, upState.received);
+  setUpPct(upState.received.size / upState.total * 100);
+  return begin;
+}
+
+async function startUpload(existingSession) {
+  if (!upFile) return toast("请先选择文件", "warn");
   document.getElementById("up-start").disabled = true;
   document.getElementById("up-pause").disabled = false;
   document.getElementById("up-pause").textContent = "暂停";
 
   try {
-    const begin = await api("POST", "/api/upload/begin", {
-      path, filename: upFile.name, size: upFile.size,
-      piece_size: piece, session: existingSession || undefined,
+    // begin（含续传）会在服务端校验/同步目标目录与分片大小
+    await syncSession(existingSession);
+    upState.paused = false;
+    await driveUpload();
+  } catch (e) {
+    finishUpload("失败：" + e.message, false);
+  }
+}
+
+// 驱动一次完整的「发送分片 → 合并」流程，绑定当前 gen。
+// 暂停期间分片大小被修改会令 gen 递增，本流程退出，由「继续」按钮重新驱动。
+async function driveUpload() {
+  const completed = await runUploadLoop();
+  if (!completed) return;     // 已取消或设置漂移后等待再次「继续」
+
+  setUpStatus("所有分片就绪，服务端合并 → 分块 → 流水线复制 3 副本 …");
+  try {
+    const r = await api("POST", "/api/upload/complete", {
+      session: upState.session,
+      path: document.getElementById("up-path").value.trim() || "/",
+      piece_size: +document.getElementById("up-piece").value,
     });
-    upState = {
-      session: begin.session, total: begin.total_pieces, piece: begin.piece_size,
-      received: new Set(begin.received || []), paused: false, running: true, aborted: false,
-    };
-    // 持久化会话（刷新页面后可续传）
-    const all = lsGet();
-    all[lsKey(upFile)] = { session: begin.session, total: begin.total_pieces,
-                           piece: begin.piece_size, path };
-    lsSet(all);
-
-    renderPieces(upState.total, upState.received);
-    const t0 = performance.now();
-    let retries = 0;
-
-    for (let i = 0; i < upState.total; i++) {
-      if (upState.aborted) return finishUpload("已取消", false);
-      while (upState.paused) await sleep(250);
-      if (upState.received.has(i)) continue;
-
-      const start = i * upState.piece;
-      const blob = upFile.slice(start, Math.min(start + upState.piece, upFile.size));
-      markPiece(i, "sending");
-      let ok = false;
-      for (let attempt = 0; attempt < 8 && !ok; attempt++) {
-        if (upState.aborted) return finishUpload("已取消", false);
-        while (upState.paused) await sleep(250);
-        try {
-          const buf = await blob.arrayBuffer();
-          // 混沌模式：客户端随机中断本次请求（模拟断网）
-          if (CHAOS() && Math.random() < 0.25) throw new Error("模拟客户端断网");
-          const b64 = bufToB64(buf);
-          const ck = await sha256Hex(buf);
-          const r = await api("POST", "/api/upload/chunk", {
-            session: upState.session, index: i, data: b64, checksum: ck,
-          });
-          ok = r.ok;
-          upState.received.add(i);
-          markPiece(i, "done");
-          retries = 0;
-        } catch (e) {
-          retries++;
-          markPiece(i, "failed");
-          setUpStatus(`分片 ${i} 失败（${e.message}），${0.3 * (attempt + 1)}s 后重试 …`);
-          await sleep(300 * (attempt + 1));
-          markPiece(i, "sending");
-        }
-      }
-      if (!ok) return finishUpload(`分片 ${i} 重试次数用尽`, false);
-      const doneCount = upState.received.size;
-      setUpPct(doneCount / upState.total * 100);
-      const speed = (doneCount * upState.piece) / ((performance.now() - t0) / 1000);
-      setUpStatus(`上传中 ${doneCount}/${upState.total} 片 · ${fmtBytes(speed)}/s${retries ? ` · 累计重试 ${retries}` : ""}`);
-    }
-
-    setUpStatus("所有分片就绪，服务端合并 → 分块 → 流水线复制 3 副本 …");
-    const r = await api("POST", "/api/upload/complete", { session: upState.session });
     const all2 = lsGet(); delete all2[lsKey(upFile)]; lsSet(all2);
     finishUpload("完成", true, r);
   } catch (e) {
     finishUpload("失败：" + e.message, false);
   }
+}
+
+// 分片发送循环，绑定启动时的 gen：暂停期间设置漂移导致分片计划重置后，
+// 本循环退出（返回 false），由「继续」按钮用新 gen 重新驱动。
+// 返回 true 表示全部分片发送完毕。
+async function runUploadLoop() {
+  const gen = upState.gen;
+  const t0 = performance.now();
+  let retries = 0;
+
+  for (let i = 0; i < upState.total; i++) {
+    if (upState.aborted) { finishUpload("已取消", false); return false; }
+    if (upState.gen !== gen) return false;
+    while (upState.paused && upState.gen === gen && !upState.aborted) {
+      await sleep(250);
+    }
+    if (upState.aborted) { finishUpload("已取消", false); return false; }
+    if (upState.gen !== gen) return false;
+    if (upState.received.has(i)) continue;
+
+    const start = i * upState.piece;
+    const blob = upFile.slice(start, Math.min(start + upState.piece, upFile.size));
+    markPiece(i, "sending");
+    let ok = false;
+    for (let attempt = 0; attempt < 8 && !ok; attempt++) {
+      if (upState.aborted) { finishUpload("已取消", false); return false; }
+      if (upState.gen !== gen) return false;
+      while (upState.paused && upState.gen === gen && !upState.aborted) {
+        await sleep(250);
+      }
+      if (upState.gen !== gen) return false;
+      try {
+        const buf = await blob.arrayBuffer();
+        // 混沌模式：客户端随机中断本次请求（模拟断网）
+        if (CHAOS() && Math.random() < 0.25) throw new Error("模拟客户端断网");
+        const b64 = bufToB64(buf);
+        const ck = await sha256Hex(buf);
+        const r = await api("POST", "/api/upload/chunk", {
+          session: upState.session, index: i, data: b64, checksum: ck,
+        });
+        ok = r.ok;
+        upState.received.add(i);
+        markPiece(i, "done");
+        retries = 0;
+      } catch (e) {
+        retries++;
+        markPiece(i, "failed");
+        setUpStatus(`分片 ${i} 失败（${e.message}），${0.3 * (attempt + 1)}s 后重试 …`);
+        await sleep(300 * (attempt + 1));
+        markPiece(i, "sending");
+      }
+    }
+    if (!ok) { finishUpload(`分片 ${i} 重试次数用尽`, false); return false; }
+    const doneCount = upState.received.size;
+    setUpPct(doneCount / upState.total * 100);
+    const speed = (doneCount * upState.piece) / ((performance.now() - t0) / 1000);
+    setUpStatus(`上传中 ${doneCount}/${upState.total} 片 · ${fmtBytes(speed)}/s${retries ? ` · 累计重试 ${retries}` : ""}`);
+  }
+  return true;
 }
 
 function finishUpload(msg, ok, result) {

@@ -36,8 +36,8 @@ from .metadata import MetadataStore
 from .util import (HttpError, LRU, RateCounter, RingBuffer, b64e, gen_id,
                    guess_mime, hour_key, http_json, http_request,
                    is_text_mime, needs_recovery, canonical_access_op,
-                   now, parse_range, sha256_bytes, short_hash, split_multi,
-                   vv_compare, vv_merge)
+                   norm_path, now, parse_range, sha256_bytes, short_hash,
+                   split_multi, vv_compare, vv_merge)
 from .versioning import VersionStore
 
 
@@ -838,10 +838,12 @@ class NameNode:
                 "manifest": manifest, "dedup_hits": dedup_hits}
 
     def write_file_internal(self, path, data, author="admin", mime=None,
-                            owner=None):
+                            owner=None, ensure_parent=True):
         """
         写文件（内部 API）：确保父目录存在 -> 存块 -> 建/覆盖 inode。
         path 为完整文件路径；data 可以是 bytes 或 str（按 UTF-8 编码）。
+        ensure_parent=False 时不自动建父目录（上传合并路径要求目录
+        在 begin 时已存在、complete 时仍存在，防止目录被删后静默重建）。
         """
         if isinstance(data, str):
             data = data.encode("utf-8")
@@ -852,7 +854,13 @@ class NameNode:
         name = path.split("/")[-1]
         mime = mime or guess_mime(name)
         with self.meta.lock:
-            self.fs.mkdirs(dir_path, owner or author)
+            if ensure_parent:
+                self.fs.mkdirs(dir_path, owner or author)
+            else:
+                parent = self.fs.resolve(dir_path, must_exist=False)
+                if parent is None or parent["type"] != "dir":
+                    raise FsError(f"目标目录不存在或不是目录: {dir_path}，"
+                                  "请在页面重新选择目录后续传")
             result = self.store_data_blocks(data, author=author)
             inode = self.fs.create_file(dir_path, name, len(data),
                                         result["content_hash"],
@@ -992,32 +1000,123 @@ class NameNode:
     # ==================================================================
     def upload_begin(self, path, filename, size, session_id=None,
                      piece_size=None, user="anonymous"):
+        if not filename:
+            raise NNError("缺少文件名")
+        path = norm_path(path)
+        size = int(size or 0)
+        if size < 0:
+            raise NNError("非法文件大小")
+        if piece_size is None:
+            piece = config.UPLOAD_PIECE_SIZE
+        else:
+            piece = int(piece_size)
+            if piece < config.UPLOAD_PIECE_MIN or piece > config.UPLOAD_PIECE_MAX:
+                raise NNError(
+                    f"分片大小需在 {config.UPLOAD_PIECE_MIN}~"
+                    f"{config.UPLOAD_PIECE_MAX} 字节之间")
+
         with self.session_lock:
             self._prune_sessions_nolock()
-            if session_id and session_id in self.sessions:
-                sess = self.sessions[session_id]
+            sess = self.sessions.get(session_id) if session_id else None
+            path_changed = piece_changed = identity_changed = False
+
+            if sess is not None and sess["completed"]:
+                # 已完成会话：同名同文件幂等返回结果视图；换了文件则按新会话重来
                 if sess["filename"] == filename and sess["size"] == size:
-                    sess["last_active"] = now()
                     return self._session_view(sess)
-            if len(self.sessions) >= config.UPLOAD_SESSION_MAX:
-                raise NNError("上传会话过多，请稍后再试")
-            sess_id = session_id or gen_id("up")
-            stage_dir = os.path.join(config.SESSION_DIR, sess_id)
-            os.makedirs(stage_dir, exist_ok=True)
-            piece = piece_size or config.UPLOAD_PIECE_SIZE
-            total_pieces = max(1, (size + piece - 1) // piece) if size else 1
-            sess = {
-                "id": sess_id, "path": path, "filename": filename,
-                "size": size, "piece_size": piece,
-                "total_pieces": total_pieces,
-                "received": {},            # idx -> {size, checksum, ts}
-                "user": user, "created_at": now(), "last_active": now(),
-                "stage_dir": stage_dir, "completed": False, "result": None,
-            }
-            self.sessions[sess_id] = sess
-        self.log_event("INFO", "upload", "begin", f"{path}/{filename}", user,
-                       f"size={size} piece={piece} pieces={total_pieces}")
-        return self._session_view(sess)
+                sess = None
+
+            if sess is not None:
+                # ------------------------------------------------ 续传会话
+                # 身份参数（文件名/大小）漂移 => 旧暂存分片不再可用，整体重置
+                old_path = sess["path"]
+                identity_changed = (sess["filename"] != filename
+                                    or sess["size"] != size)
+                piece_changed = sess["piece_size"] != piece
+                path_changed = sess["path"] != path
+                # 仅分片大小 / 文件身份变化才需要作废已暂存分片；
+                # 目标目录只是最终落点，不影响切片内容，进度应保留。
+                if identity_changed or piece_changed:
+                    self._reset_session_staging_nolock(sess)
+                    sess.update({
+                        "path": path, "filename": filename, "size": size,
+                        "piece_size": piece,
+                        "total_pieces": max(1, (size + piece - 1) // piece)
+                                        if size else 1,
+                        "received": {},
+                    })
+                elif path_changed:
+                    sess["path"] = path
+                sess["last_active"] = now()
+                action = "resume"
+                if identity_changed:
+                    action = "resume-reset"
+            else:
+                # ----------------------------------------- 全新（或复用过期 id）
+                if len(self.sessions) >= config.UPLOAD_SESSION_MAX:
+                    raise NNError("上传会话过多，请稍后再试")
+                sess_id = session_id or gen_id("up")
+                stage_dir = os.path.join(config.SESSION_DIR, sess_id)
+                os.makedirs(stage_dir, exist_ok=True)
+                sess = {
+                    "id": sess_id, "path": path, "filename": filename,
+                    "size": size, "piece_size": piece,
+                    "total_pieces": max(1, (size + piece - 1) // piece)
+                                    if size else 1,
+                    "received": {},            # idx -> {size, checksum, ts}
+                    "user": user, "created_at": now(), "last_active": now(),
+                    "stage_dir": stage_dir, "completed": False, "result": None,
+                }
+                self.sessions[sess_id] = sess
+                action = "create"
+
+        # 目标目录校验放在会话锁外（meta 锁顺序纪律）。
+        # 新上传保持「自动建目录」的既有体验；续传则严格要求目录当前仍然存在，
+        # 避免暂停期间目录被删后静默重建并误报成功。
+        if action == "create":
+            with self.meta.lock:
+                self.fs.mkdirs(path, user)
+        else:
+            with self.meta.lock:
+                inode = self.fs.resolve(path, must_exist=False)
+                if inode is None or inode["type"] != "dir":
+                    raise NNError(f"目标目录不存在或不是目录: {path}，"
+                                  "请在页面重新选择已存在的目录后续传")
+        if path_changed:
+            self.log_event("INFO", "upload", "resume-sync",
+                           f"{path}/{filename}", user,
+                           f"续传参数同步: path={old_path} -> {path}"
+                           + (", piece_size 已变更，旧分片作废重传"
+                              if piece_changed else ""))
+        elif piece_changed:
+            self.log_event("INFO", "upload", "resume-sync",
+                           f"{path}/{filename}", user,
+                           f"续传参数同步: piece_size={piece}, "
+                           "旧分片作废重传")
+        elif action == "resume":
+            self.log_event("INFO", "upload", "resume",
+                           f"{path}/{filename}", user,
+                           f"已收 {len(sess['received'])} / "
+                           f"{sess['total_pieces']} 片")
+        else:
+            self.log_event("INFO", "upload", "begin", f"{path}/{filename}",
+                           user,
+                           f"size={size} piece={piece} "
+                           f"pieces={sess['total_pieces']}")
+        view = self._session_view(sess)
+        view["resynced"] = bool(path_changed or piece_changed
+                                or identity_changed)
+        view["piece_reset"] = bool(identity_changed or piece_changed)
+        view["path_changed"] = path_changed
+        return view
+
+    def _reset_session_staging_nolock(self, sess):
+        """作废全部已暂存分片并清空暂存目录（分片大小/文件身份变更时调用）。"""
+        self._cleanup_session_dir(sess)
+        try:
+            os.makedirs(sess["stage_dir"], exist_ok=True)
+        except Exception:
+            pass
 
     def _session_view(self, sess):
         return {
@@ -1056,6 +1155,20 @@ class NameNode:
         index = int(index)
         if index < 0 or index >= sess["total_pieces"]:
             raise NNError(f"非法分片序号: {index}")
+        # 分片长度必须与会话当前的 piece_size 对齐（末片为余数）。
+        # 参数已漂移却仍按旧分片续传的客户端会在这里被拦下，而不是静默拼错。
+        expected_max = sess["piece_size"]
+        expected_last = sess["size"] - (sess["total_pieces"] - 1) * \
+            sess["piece_size"] if sess["size"] else len(data)
+        if index == sess["total_pieces"] - 1:
+            if len(data) != expected_last:
+                raise NNError(
+                    f"末片 {index} 长度 {len(data)} 与当前分片大小"
+                    f"（应为 {expected_last}）不符，请按新设置重新切片后续传")
+        elif len(data) != expected_max:
+            raise NNError(
+                f"分片 {index} 长度 {len(data)} 与当前分片大小"
+                f"（{expected_max}）不符，请按新设置重新切片后续传")
         piece_path = os.path.join(sess["stage_dir"], f"piece_{index:06d}")
         from .util import atomic_write_bytes
         atomic_write_bytes(piece_path, data)     # 分片暂存也原子写
@@ -1068,7 +1181,8 @@ class NameNode:
                 "received_count": done, "total_pieces": sess["total_pieces"],
                 "complete": done == sess["total_pieces"]}
 
-    def upload_complete(self, session_id, user="anonymous"):
+    def upload_complete(self, session_id, user="anonymous",
+                        path=None, piece_size=None):
         with self.session_lock:
             sess = self.sessions.get(session_id)
             if not sess:
@@ -1080,18 +1194,32 @@ class NameNode:
                               f"{missing[:10]}")
             if sess["completed"]:
                 return sess["result"]
+            # 最终一致性校验：客户端回显当前设置，与服务端会话不匹配说明
+            # 页面设置在暂停期间被改过却未走续传同步，拒绝静默按旧参数完成。
+            if path is not None and norm_path(path) != sess["path"]:
+                raise NNError("目标目录与上传会话不一致，请先续传同步或重新开始")
+            if piece_size is not None and \
+                    int(piece_size) != sess["piece_size"]:
+                raise NNError("分片大小与上传会话不一致，请先续传同步或重新开始")
+            sess_path = sess["path"]
+            total_pieces = sess["total_pieces"]
+            stage_dir = sess["stage_dir"]
+            sess_size = sess["size"]
         # 读取全部分片 -> 拼接 -> 校验总大小
         datas = []
-        for i in range(sess["total_pieces"]):
-            piece_path = os.path.join(sess["stage_dir"], f"piece_{i:06d}")
+        for i in range(total_pieces):
+            piece_path = os.path.join(stage_dir, f"piece_{i:06d}")
             with open(piece_path, "rb") as f:
                 datas.append(f.read())
         data = b"".join(datas)
-        if sess["size"] and len(data) != sess["size"]:
-            raise NNError(f"拼接后大小不符: {len(data)} != {sess['size']}")
+        if sess_size and len(data) != sess_size:
+            raise NNError(f"拼接后大小不符: {len(data)} != {sess_size}")
         t0 = now()
-        full_path = sess["path"].rstrip("/") + "/" + sess["filename"]
-        info = self.write_file_internal(full_path, data, user)
+        full_path = sess_path.rstrip("/") + "/" + sess["filename"]
+        # ensure_parent=False：目录在 begin 时已校验存在；此处若已被删除则
+        # 明确报错，而不是静默 mkdirs 重建后误报上传成功。
+        info = self.write_file_internal(full_path, data, user,
+                                        ensure_parent=False)
         elapsed = now() - t0
         result = {
             "ok": True, "file": info, "elapsed_s": round(elapsed, 3),

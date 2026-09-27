@@ -324,7 +324,9 @@ def api_upload_chunk(ctx):
 @route("POST", "/api/upload/complete")
 def api_upload_complete(ctx):
     body = ctx.json()
-    result = ctx.nn.upload_complete(body.get("session"), ctx.actor())
+    result = ctx.nn.upload_complete(
+        body.get("session"), ctx.actor(),
+        path=body.get("path"), piece_size=body.get("piece_size"))
     return result
 
 
