@@ -36,8 +36,8 @@ from .metadata import MetadataStore
 from .util import (HttpError, LRU, RateCounter, RingBuffer, b64e, gen_id,
                    guess_mime, hour_key, http_json, http_request,
                    is_text_mime, needs_recovery, canonical_access_op,
-                   now, parse_range, sha256_bytes, short_hash, split_multi,
-                   vv_compare, vv_merge)
+                   norm_path, now, parse_range, sha256_bytes, short_hash,
+                   split_multi, vv_compare, vv_merge)
 from .versioning import VersionStore
 
 
@@ -992,12 +992,26 @@ class NameNode:
     # ==================================================================
     def upload_begin(self, path, filename, size, session_id=None,
                      piece_size=None, user="anonymous"):
+        path = norm_path(path)
+        if piece_size is not None:
+            self._check_piece_size(piece_size)
+            piece_size = int(piece_size)
         with self.session_lock:
             self._prune_sessions_nolock()
             if session_id and session_id in self.sessions:
                 sess = self.sessions[session_id]
                 if sess["filename"] == filename and sess["size"] == size:
+                    # 断点续传：恢复会话时校验并同步关键参数（目标目录、
+                    # 分片大小）。否则页面当前设置与会话漂移——文件仍落
+                    # 到旧目录、按旧分片大小继续，甚至落到已删除的目录。
+                    changes = [] if sess["completed"] else \
+                        self._sync_resume_params_nolock(sess, path,
+                                                        piece_size)
                     sess["last_active"] = now()
+                    if changes:
+                        self.log_event("INFO", "upload", "resume_sync",
+                                       f"{path}/{filename}", user,
+                                       "；".join(changes))
                     return self._session_view(sess)
             if len(self.sessions) >= config.UPLOAD_SESSION_MAX:
                 raise NNError("上传会话过多，请稍后再试")
@@ -1018,6 +1032,53 @@ class NameNode:
         self.log_event("INFO", "upload", "begin", f"{path}/{filename}", user,
                        f"size={size} piece={piece} pieces={total_pieces}")
         return self._session_view(sess)
+
+    @staticmethod
+    def _check_piece_size(piece_size):
+        """分片大小必须在允许范围内（新建与续传会话同样校验）。"""
+        try:
+            piece = int(piece_size)
+        except (TypeError, ValueError):
+            raise NNError(f"非法分片大小: {piece_size}")
+        if piece < config.UPLOAD_PIECE_MIN or piece > config.UPLOAD_PIECE_MAX:
+            raise NNError(f"分片大小需在 {config.UPLOAD_PIECE_MIN} ~ "
+                          f"{config.UPLOAD_PIECE_MAX} 字节之间: {piece}")
+
+    def _sync_resume_params_nolock(self, sess, path, piece_size):
+        """
+        续传恢复会话时校验并同步关键参数（调用方须持有 session_lock）。
+        返回变更描述列表（无变更为空）：
+          * 目标目录必须仍存在且为目录——暂停期间被删除则明确报错，
+            而不是静默重建或把文件落到已不存在的位置；
+          * 目标目录以页面当前选择为准，更新 sess["path"]；
+          * 分片大小以页面当前选择为准——大小变化时旧分片边界全部
+            失效，清空已暂存分片并按新大小重算分片数（重新上传），
+            保证拼接结果与用户当前设置一致。
+        """
+        changes = []
+        with self.meta.lock:
+            node = self.fs.resolve(path, must_exist=False)
+            dir_ok = node is not None and node["type"] == "dir"
+        if not dir_ok:
+            raise NNError(f"目标目录不存在或已被删除: {path}，"
+                          f"请重新选择目标目录后再续传")
+        if path != sess["path"]:
+            changes.append(f"目标目录 {sess['path']} -> {path}")
+            sess["path"] = path
+        if piece_size is not None and piece_size != sess["piece_size"]:
+            old_piece = sess["piece_size"]
+            dropped = len(sess["received"])
+            sess["piece_size"] = piece_size
+            sess["total_pieces"] = max(
+                1, (sess["size"] + sess["piece_size"] - 1)
+                // sess["piece_size"]) if sess["size"] else 1
+            sess["received"] = {}
+            self._cleanup_session_dir(sess)
+            os.makedirs(sess["stage_dir"], exist_ok=True)
+            changes.append(
+                f"分片大小 {old_piece} -> {sess['piece_size']} 字节，"
+                f"已暂存的 {dropped} 个旧分片作废，按新大小重新上传")
+        return changes
 
     def _session_view(self, sess):
         return {
